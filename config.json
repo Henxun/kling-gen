@@ -1,0 +1,56 @@
+{
+  "auth_mode": "jwt",
+  "api_key": "",
+  "access_key": "",
+  "secret_key": "",
+  "base_url": "https://api-beijing.klingai.com",
+  "create_endpoint": "/v1/images/generations",
+  "query_endpoint_template": "/v1/images/generations/{task_id}",
+  "request_timeout_seconds": 60,
+  "poll_interval_seconds": 3,
+  "poll_timeout_seconds": 300,
+  "token_ttl_seconds": 1800,
+  "token_not_before_skew_seconds": 5,
+  "token_clock_offset_seconds": 0,
+  "output_dir": "输出图片",
+  "log_dir": "日志",
+  "headers": {
+    "Authorization": "{authorization}",
+    "Content-Type": "application/json"
+  },
+  "model_name": "kling-v2-1",
+  "image_count": 1,
+  "external_task_id": "",
+  "callback_url": "",
+  "request_template": {
+    "model_name": "{model_name}",
+    "prompt": "{prompt}",
+    "negative_prompt": "{negative_prompt}",
+    "image": "{image_value}",
+    "n": "{image_count}",
+    "external_task_id": "{external_task_id}",
+    "callback_url": "{callback_url}"
+  },
+  "task_id_path": "data.task_id",
+  "status_path": "data.status",
+  "result_url_path": "data.images.0.url",
+  "error_message_path": "message",
+  "success_status_values": [
+    "success",
+    "succeeded",
+    "completed"
+  ],
+  "running_status_values": [
+    "submitted",
+    "pending",
+    "queued",
+    "running",
+    "processing"
+  ],
+  "failed_status_values": [
+    "failed",
+    "error",
+    "cancelled",
+    "canceled"
+  ]
+}
