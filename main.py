@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -37,6 +38,12 @@ COLUMN_LABELS = ['图片路径', '提示词', '状态', '结果文件']
 # 常见导入表头别名，用于兼容中文与英文命名。
 IMAGE_COLUMN_ALIASES = ['image_path', '图片路径', '图片', 'image', 'path']
 PROMPT_COLUMN_ALIASES = ['prompt', '提示词', '描述词', '文案']
+
+
+API_MODE_OPTIONS = [
+    ('generations', 'Generations'),
+    ('omni_image', 'Omni Image'),
+]
 
 
 def normalize_header_name(header_name: str) -> str:
@@ -174,6 +181,8 @@ class MainWindow(QMainWindow):
 
         self.table_widget = QTableWidget(0, len(COLUMN_KEYS))
         self.status_badge = QLabel('等待导入表格')
+        self.mode_label = QLabel('请求模式')
+        self.mode_selector = QComboBox()
         self.source_preview_label = QLabel('选择表格中的一行后查看原图')
         self.result_preview_label = QLabel('生成完成后在这里预览结果')
         self.log_output = QPlainTextEdit()
@@ -219,10 +228,17 @@ class MainWindow(QMainWindow):
         add_button.clicked.connect(self.append_task_row)
         remove_button.clicked.connect(self.remove_selected_rows)
         run_button.clicked.connect(self.start_generation)
+        self.mode_selector.currentIndexChanged.connect(self.on_mode_changed)
+
+        for mode_value, mode_label in API_MODE_OPTIONS:
+            self.mode_selector.addItem(mode_label, mode_value)
+        self.set_mode_selector_value(str(self.config.get('api_mode', 'generations')).strip().lower() or 'generations')
 
         action_layout.addWidget(import_button)
         action_layout.addWidget(add_button)
         action_layout.addWidget(remove_button)
+        action_layout.addWidget(self.mode_label)
+        action_layout.addWidget(self.mode_selector)
         action_layout.addStretch(1)
         action_layout.addWidget(self.status_badge)
         action_layout.addWidget(run_button)
@@ -343,6 +359,16 @@ class MainWindow(QMainWindow):
             QPushButton#primary_button:hover {
                 background: #17665f;
             }
+            QComboBox {
+                background: #ffffff;
+                color: #1d3557;
+                border: 1px solid #d6c7ae;
+                border-radius: 12px;
+                padding: 6px 10px;
+                min-width: 140px;
+                font-size: 13px;
+                font-weight: 600;
+            }
             QTableWidget {
                 background: #fffdf8;
                 alternate-background-color: #faf4e9;
@@ -379,6 +405,38 @@ class MainWindow(QMainWindow):
             font-weight: 600;
             '''
         )
+
+    def set_mode_selector_value(self, mode_value: str) -> None:
+        '''Sync mode selector with config value.'''
+
+        target_index = self.mode_selector.findData(mode_value)
+        if target_index < 0:
+            target_index = self.mode_selector.findData('generations')
+        if target_index >= 0:
+            self.mode_selector.setCurrentIndex(target_index)
+
+    def get_selected_api_mode(self) -> str:
+        '''Read selected API mode from combo box.'''
+
+        selected_mode = self.mode_selector.currentData()
+        if isinstance(selected_mode, str) and selected_mode.strip():
+            return selected_mode.strip()
+        return 'generations'
+
+    def refresh_client_for_selected_mode(self) -> None:
+        '''Recreate client according to selected request mode.'''
+
+        selected_mode = self.get_selected_api_mode()
+        self.config['api_mode'] = selected_mode
+        self.client = KlingAIClient(self.config)
+        self.log(f'已切换请求模式: {selected_mode}')
+
+    def on_mode_changed(self, _index: int) -> None:
+        '''Apply mode selection immediately when idle.'''
+
+        if self.worker_thread and self.worker_thread.isRunning():
+            return
+        self.refresh_client_for_selected_mode()
 
     def append_task_row(self, image_path: str = '', prompt: str = '') -> None:
         '''新增一行任务数据。'''
@@ -496,6 +554,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '提示', '没有可执行的任务，请确认表格中同时包含图片路径和提示词。')
             return
 
+        self.refresh_client_for_selected_mode()
         self.worker_thread = GenerateWorker(self.client, rows_to_run)
         self.worker_thread.row_started.connect(self.on_row_started)
         self.worker_thread.row_finished.connect(self.on_row_finished)
@@ -504,6 +563,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.start()
 
         self.table_widget.setDisabled(True)
+        self.mode_selector.setDisabled(True)
         self.status_badge.setText(f'正在生成 {len(rows_to_run)} 条任务')
         self.log('批量生成已启动')
 
@@ -524,6 +584,7 @@ class MainWindow(QMainWindow):
         '''批量任务全部结束后的收尾逻辑。'''
 
         self.table_widget.setDisabled(False)
+        self.mode_selector.setDisabled(False)
         self.status_badge.setText('全部生成完成')
         self.log('批量生成结束')
         QMessageBox.information(self, '提示', '全部任务已经处理完成。')

@@ -157,6 +157,93 @@ def resolve_image_value(image_input: str) -> str:
     return encode_image_to_base64(normalized)
 
 
+def parse_json_like_value(raw_value: Any, field_name: str) -> Any:
+    '''Parse JSON-like string values while keeping native list/dict inputs.'''
+
+    if isinstance(raw_value, (list, dict)):
+        return raw_value
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f'Invalid JSON in {field_name}: {text}') from exc
+    return raw_value
+
+
+def normalize_image_list_input(raw_value: Any, fallback_image_path: str = '') -> list[dict[str, Any]]:
+    '''Normalize image_list input to API expected list of {"image": "..."} objects.'''
+
+    parsed_value = parse_json_like_value(raw_value, 'image_list')
+    normalized_images: list[dict[str, Any]] = []
+
+    if isinstance(parsed_value, list):
+        for image_item in parsed_value:
+            if isinstance(image_item, str):
+                image_value = resolve_image_value(image_item)
+                if image_value:
+                    normalized_images.append({'image': image_value})
+                continue
+
+            if isinstance(image_item, dict):
+                image_value = resolve_image_value(str(image_item.get('image', '')))
+                if not image_value:
+                    continue
+                normalized_item = dict(image_item)
+                normalized_item['image'] = image_value
+                normalized_images.append(normalized_item)
+                continue
+
+            raise ValueError(f'Invalid image_list item: {image_item!r}')
+    elif parsed_value not in (None, ''):
+        raise ValueError('image_list must be a JSON array, list, or empty value')
+
+    if not normalized_images and fallback_image_path.strip():
+        normalized_images.append({'image': resolve_image_value(fallback_image_path)})
+
+    return normalized_images
+
+
+def normalize_element_list_input(raw_value: Any) -> list[dict[str, Any]]:
+    '''Normalize element_list input to API expected list of {"element_id": ...} objects.'''
+
+    parsed_value = parse_json_like_value(raw_value, 'element_list')
+    normalized_elements: list[dict[str, Any]] = []
+
+    if isinstance(parsed_value, list):
+        for element_item in parsed_value:
+            if isinstance(element_item, dict):
+                if 'element_id' not in element_item:
+                    raise ValueError(f'element_list item missing element_id: {element_item!r}')
+                normalized_elements.append(dict(element_item))
+                continue
+
+            if isinstance(element_item, (int, str)):
+                element_id = str(element_item).strip()
+                if element_id:
+                    normalized_elements.append({'element_id': int(element_id)})
+                continue
+
+            raise ValueError(f'Invalid element_list item: {element_item!r}')
+    elif parsed_value not in (None, ''):
+        raise ValueError('element_list must be a JSON array, list, or empty value')
+
+    return normalized_elements
+
+
+def resolve_mode_config_value(config: dict[str, Any], api_mode: str, mode_map_key: str, fallback_key: str, default: Any) -> Any:
+    '''Read mode-specific config value first, then fallback to shared key/default.'''
+
+    mode_map = config.get(mode_map_key, {})
+    if isinstance(mode_map, dict) and api_mode in mode_map:
+        return mode_map[api_mode]
+    return config.get(fallback_key, default)
+
+
 class KlingAIClient:
     '''KlingAI client with config-driven request/response mapping.'''
 
@@ -169,8 +256,17 @@ class KlingAIClient:
         self.secret_key = get_config_or_env(config, 'secret_key', 'KLING_SECRET_KEY')
 
         self.base_url = str(config.get('base_url', '')).rstrip('/')
-        self.create_endpoint = str(config.get('create_endpoint', ''))
-        self.query_endpoint_template = str(config.get('query_endpoint_template', ''))
+        self.api_mode = str(config.get('api_mode', 'generations')).strip().lower()
+        create_endpoints = config.get('create_endpoints', {})
+        query_endpoints = config.get('query_endpoint_templates', {})
+        if isinstance(create_endpoints, dict) and self.api_mode in create_endpoints:
+            self.create_endpoint = str(create_endpoints[self.api_mode])
+        else:
+            self.create_endpoint = str(config.get('create_endpoint', ''))
+        if isinstance(query_endpoints, dict) and self.api_mode in query_endpoints:
+            self.query_endpoint_template = str(query_endpoints[self.api_mode])
+        else:
+            self.query_endpoint_template = str(config.get('query_endpoint_template', ''))
         self.request_timeout = int(config.get('request_timeout_seconds', 60))
         self.poll_interval_seconds = float(config.get('poll_interval_seconds', 3))
         self.poll_timeout_seconds = float(config.get('poll_timeout_seconds', 300))
@@ -180,20 +276,61 @@ class KlingAIClient:
 
         self.output_dir = Path(config.get('output_dir', DEFAULT_OUTPUT_DIR))
         self.headers_template = config.get('headers', {})
-        self.request_template = config.get('request_template', {})
-        self.task_id_path = str(config.get('task_id_path', 'data.task_id'))
-        self.status_path = str(config.get('status_path', 'data.status'))
-        self.result_url_path = str(config.get('result_url_path', 'data.images.0.url'))
-        self.error_message_path = str(config.get('error_message_path', 'message'))
+        request_templates = config.get('request_templates', {})
+        if isinstance(request_templates, dict) and self.api_mode in request_templates:
+            self.request_template = request_templates[self.api_mode]
+        else:
+            self.request_template = config.get('request_template', {})
+        self.task_id_path = str(
+            resolve_mode_config_value(config, self.api_mode, 'task_id_paths', 'task_id_path', 'data.task_id')
+        )
+        self.task_id_required = bool(config.get('task_id_required', True))
+        self.status_path = str(resolve_mode_config_value(config, self.api_mode, 'status_paths', 'status_path', 'data.status'))
+        self.result_url_path = str(
+            resolve_mode_config_value(config, self.api_mode, 'result_url_paths', 'result_url_path', 'data.images.0.url')
+        )
+        self.result_url_fallback_paths = resolve_mode_config_value(
+            config,
+            self.api_mode,
+            'result_url_fallback_paths_by_mode',
+            'result_url_fallback_paths',
+            [],
+        )
+        self.create_result_url_path = str(
+            resolve_mode_config_value(config, self.api_mode, 'create_result_url_paths', 'create_result_url_path', '')
+        ).strip()
+        self.error_message_path = str(
+            resolve_mode_config_value(config, self.api_mode, 'error_message_paths', 'error_message_path', 'message')
+        )
         self.success_status_values = {
-            str(status).lower() for status in config.get('success_status_values', ['success', 'succeeded', 'completed'])
+            str(status).lower()
+            for status in resolve_mode_config_value(
+                config,
+                self.api_mode,
+                'success_status_values_by_mode',
+                'success_status_values',
+                ['success', 'succeeded', 'completed'],
+            )
         }
         self.running_status_values = {
             str(status).lower()
-            for status in config.get('running_status_values', ['submitted', 'pending', 'queued', 'running', 'processing'])
+            for status in resolve_mode_config_value(
+                config,
+                self.api_mode,
+                'running_status_values_by_mode',
+                'running_status_values',
+                ['submitted', 'pending', 'queued', 'running', 'processing'],
+            )
         }
         self.failed_status_values = {
-            str(status).lower() for status in config.get('failed_status_values', ['failed', 'error', 'cancelled', 'canceled'])
+            str(status).lower()
+            for status in resolve_mode_config_value(
+                config,
+                self.api_mode,
+                'failed_status_values_by_mode',
+                'failed_status_values',
+                ['failed', 'error', 'cancelled', 'canceled'],
+            )
         }
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +459,7 @@ class KlingAIClient:
             logger.error('Response is not valid JSON: {}', text)
             raise RuntimeError(f'Response is not valid JSON: {text}') from decode_error
 
-    def create_task(self, task_data: dict[str, str]) -> tuple[str, dict[str, Any]]:
+    def create_task(self, task_data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         '''Create generation task and return task id with raw response.'''
 
         if self.auth_mode == 'jwt':
@@ -335,31 +472,50 @@ class KlingAIClient:
         prompt = str(task_data.get('prompt', '')).strip()
         negative_prompt = str(task_data.get('negative_prompt', '')).strip()
         output_name = str(task_data.get('output_name', '')).strip()
+        model_names = self.config.get('model_names', {})
+        default_model_name = self.config.get('model_name', 'kling-v2-1')
+        if isinstance(model_names, dict) and self.api_mode in model_names:
+            default_model_name = model_names[self.api_mode]
+        model_name = str(task_data.get('model_name', default_model_name)).strip()
+        image_count = int(task_data.get('n', self.config.get('image_count', 1)))
+
+        image_list_value = task_data.get('image_list', self.config.get('image_list', []))
+        element_list_value = task_data.get('element_list', self.config.get('element_list', []))
+        image_list = normalize_image_list_input(image_list_value, fallback_image_path=image_path)
+        element_list = normalize_element_list_input(element_list_value)
 
         render_context = {
             'prompt': prompt,
             'negative_prompt': negative_prompt,
             'image_path': image_path,
             'image_value': resolve_image_value(image_path) if image_path else '',
+            'image_list': image_list,
+            'element_list': element_list,
             'output_name': output_name,
             'image_name': Path(image_path).name if image_path else '',
-            'model_name': self.config.get('model_name', 'kling-v2-1'),
-            'image_count': int(self.config.get('image_count', 1)),
-            'external_task_id': self.config.get('external_task_id', ''),
-            'callback_url': self.config.get('callback_url', ''),
+            'model_name': model_name,
+            'image_count': image_count,
+            'n': image_count,
+            'external_task_id': task_data.get('external_task_id', self.config.get('external_task_id', '')),
+            'callback_url': task_data.get('callback_url', self.config.get('callback_url', '')),
+            'resolution': task_data.get('resolution', self.config.get('resolution', '')),
+            'aspect_ratio': task_data.get('aspect_ratio', self.config.get('aspect_ratio', '')),
         }
         payload = remove_empty_values(render_template(self.request_template, render_context))
 
         response_payload = self.send_json_request('POST', self.build_url(self.create_endpoint), payload)
         task_id = str(get_nested_value(response_payload, self.task_id_path, '')).strip()
-        if not task_id:
+        must_have_task_id = self.task_id_required and bool(self.query_endpoint_template.strip())
+        if must_have_task_id and not task_id:
             raise RuntimeError(f'Unable to extract task id from response: {response_payload}')
-        logger.info('Task created: {}', task_id)
+        logger.info('Task created: {}', task_id or '<no-task-id>')
         return task_id, response_payload
 
     def query_task(self, task_id: str) -> dict[str, Any]:
         '''Query task by task id.'''
 
+        if not self.query_endpoint_template.strip():
+            raise RuntimeError('query_endpoint_template is empty; task polling is disabled for current api_mode')
         endpoint = self.query_endpoint_template.format(task_id=parse.quote(task_id))
         payload = self.send_json_request('GET', self.build_url(endpoint))
         logger.info('Task queried: {}', task_id)
@@ -372,6 +528,7 @@ class KlingAIClient:
         while time.time() < deadline:
             payload = self.query_task(task_id)
             status = str(get_nested_value(payload, self.status_path, '')).strip().lower()
+            logger.info('Task response: {}', payload)
             logger.info('Task status: {} -> {}', task_id, status or 'unknown')
 
             if status in self.success_status_values:
@@ -406,12 +563,22 @@ class KlingAIClient:
         logger.info('Downloaded result to: {}', output_path)
         return output_path
 
-    def run_task(self, task_data: dict[str, str]) -> dict[str, Any]:
+    def run_task(self, task_data: dict[str, Any]) -> dict[str, Any]:
         '''Run full lifecycle: create task, wait result, download image.'''
 
         task_id, create_response = self.create_task(task_data)
-        result_response = self.wait_for_result(task_id)
+        if task_id:
+            result_response = self.wait_for_result(task_id)
+        else:
+            result_response = create_response
         result_url = str(get_nested_value(result_response, self.result_url_path, '')).strip()
+        if not result_url and isinstance(self.result_url_fallback_paths, list):
+            for fallback_path in self.result_url_fallback_paths:
+                result_url = str(get_nested_value(result_response, str(fallback_path), '')).strip()
+                if result_url:
+                    break
+        if not result_url and self.create_result_url_path:
+            result_url = str(get_nested_value(create_response, self.create_result_url_path, '')).strip()
         if not result_url:
             raise RuntimeError(f'Completed task without result URL: {result_response}')
 

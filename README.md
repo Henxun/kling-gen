@@ -26,3 +26,8 @@
 - 使用loguru库来记录日志
 - 所有操作都要必须记录到日志文件中
 - 日志文件要中文
+## Omni Image 接口选项
+- 在 `config.json` 设置 `"api_mode": "omni_image"` 可切换到 `POST /v1/images/omni-image`。
+- `request_templates.omni_image` 已内置：`model_name`、`prompt`、`element_list`、`image_list`、`resolution`、`n`、`aspect_ratio`。
+- 默认模型可由 `model_names.omni_image` 指定（当前为 `kling-image-o1`）。
+- 运行时通过 `run_task({...})` 传入同名字段可覆盖配置值。

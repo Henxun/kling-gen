@@ -4,6 +4,15 @@
   "access_key": "",
   "secret_key": "",
   "base_url": "https://api-beijing.klingai.com",
+  "api_mode": "generations",
+  "create_endpoints": {
+    "generations": "/v1/images/generations",
+    "omni_image": "/v1/images/omni-image"
+  },
+  "query_endpoint_templates": {
+    "generations": "/v1/images/generations/{task_id}",
+    "omni_image": "/v1/images/omni-image/{task_id}"
+  },
   "create_endpoint": "/v1/images/generations",
   "query_endpoint_template": "/v1/images/generations/{task_id}",
   "request_timeout_seconds": 60,
@@ -19,9 +28,53 @@
     "Content-Type": "application/json"
   },
   "model_name": "kling-v2-1",
+  "model_names": {
+    "generations": "kling-v2-1",
+    "omni_image": "kling-image-o1"
+  },
   "image_count": 1,
+  "resolution": "2k",
+  "aspect_ratio": "3:2",
+  "element_list": [
+    {
+      "element_id": 829836802793406551
+    }
+  ],
+  "image_list": [
+    {
+      "image": "https://v1-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/multi-4.png"
+    },
+    {
+      "image": "https://p2-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/video_effects/1.png"
+    },
+    {
+      "image": "https://p2-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/video_effects/4.png"
+    }
+  ],
   "external_task_id": "",
   "callback_url": "",
+  "request_templates": {
+    "generations": {
+      "model_name": "{model_name}",
+      "prompt": "{prompt}",
+      "negative_prompt": "{negative_prompt}",
+      "image": "{image_value}",
+      "n": "{image_count}",
+      "external_task_id": "{external_task_id}",
+      "callback_url": "{callback_url}"
+    },
+    "omni_image": {
+      "model_name": "{model_name}",
+      "prompt": "{prompt}",
+      "element_list": "{element_list}",
+      "image_list": "{image_list}",
+      "resolution": "{resolution}",
+      "n": "{n}",
+      "aspect_ratio": "{aspect_ratio}",
+      "external_task_id": "{external_task_id}",
+      "callback_url": "{callback_url}"
+    }
+  },
   "request_template": {
     "model_name": "{model_name}",
     "prompt": "{prompt}",
@@ -32,14 +85,43 @@
     "callback_url": "{callback_url}"
   },
   "task_id_path": "data.task_id",
+  "task_id_paths": {
+    "generations": "data.task_id",
+    "omni_image": "data.task_id"
+  },
   "status_path": "data.status",
+  "status_paths": {
+    "generations": "data.task_status",
+    "omni_image": "data.task_status"
+  },
   "result_url_path": "data.images.0.url",
+  "result_url_paths": {
+    "generations": "data.task_result.images.0.url",
+    "omni_image": "data.task_result.images.0.url"
+  },
+  "result_url_fallback_paths_by_mode": {
+    "omni_image": [
+      "data.task_result.series_images.0.url"
+    ]
+  },
   "error_message_path": "message",
+  "error_message_paths": {
+    "generations": "data.task_status_msg",
+    "omni_image": "data.task_status_msg"
+  },
   "success_status_values": [
     "success",
     "succeeded",
     "completed"
   ],
+  "success_status_values_by_mode": {
+    "generations": [
+      "succeed"
+    ],
+    "omni_image": [
+      "succeed"
+    ]
+  },
   "running_status_values": [
     "submitted",
     "pending",
@@ -47,10 +129,28 @@
     "running",
     "processing"
   ],
+  "running_status_values_by_mode": {
+    "generations": [
+      "submitted",
+      "processing"
+    ],
+    "omni_image": [
+      "submitted",
+      "processing"
+    ]
+  },
   "failed_status_values": [
     "failed",
     "error",
     "cancelled",
     "canceled"
-  ]
+  ],
+  "failed_status_values_by_mode": {
+    "generations": [
+      "failed"
+    ],
+    "omni_image": [
+      "failed"
+    ]
+  }
 }
