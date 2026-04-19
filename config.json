@@ -35,22 +35,6 @@
   "image_count": 1,
   "resolution": "2k",
   "aspect_ratio": "3:2",
-  "element_list": [
-    {
-      "element_id": 829836802793406551
-    }
-  ],
-  "image_list": [
-    {
-      "image": "https://v1-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/multi-4.png"
-    },
-    {
-      "image": "https://p2-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/video_effects/1.png"
-    },
-    {
-      "image": "https://p2-kling.klingai.com/kcdn/cdn-kcdn112452/kling-qa-test/video_effects/4.png"
-    }
-  ],
   "external_task_id": "",
   "callback_url": "",
   "request_templates": {

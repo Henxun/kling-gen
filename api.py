@@ -471,7 +471,6 @@ class KlingAIClient:
         image_path = str(task_data.get('image_path', '')).strip()
         prompt = str(task_data.get('prompt', '')).strip()
         negative_prompt = str(task_data.get('negative_prompt', '')).strip()
-        output_name = str(task_data.get('output_name', '')).strip()
         model_names = self.config.get('model_names', {})
         default_model_name = self.config.get('model_name', 'kling-v2-1')
         if isinstance(model_names, dict) and self.api_mode in model_names:
@@ -479,29 +478,33 @@ class KlingAIClient:
         model_name = str(task_data.get('model_name', default_model_name)).strip()
         image_count = int(task_data.get('n', self.config.get('image_count', 1)))
 
-        image_list_value = task_data.get('image_list', self.config.get('image_list', []))
-        element_list_value = task_data.get('element_list', self.config.get('element_list', []))
+        image_list_value = task_data.get('image_list', [])
+        element_list_value = task_data.get('element_list', [])
         image_list = normalize_image_list_input(image_list_value, fallback_image_path=image_path)
         element_list = normalize_element_list_input(element_list_value)
 
-        render_context = {
+        # Base render context with common fields
+        base_context = {
             'prompt': prompt,
-            'negative_prompt': negative_prompt,
-            'image_path': image_path,
-            'image_value': resolve_image_value(image_path) if image_path else '',
-            'image_list': image_list,
-            'element_list': element_list,
-            'output_name': output_name,
-            'image_name': Path(image_path).name if image_path else '',
             'model_name': model_name,
-            'image_count': image_count,
             'n': image_count,
-            'external_task_id': task_data.get('external_task_id', self.config.get('external_task_id', '')),
-            'callback_url': task_data.get('callback_url', self.config.get('callback_url', '')),
             'resolution': task_data.get('resolution', self.config.get('resolution', '')),
             'aspect_ratio': task_data.get('aspect_ratio', self.config.get('aspect_ratio', '')),
+            'external_task_id': task_data.get('external_task_id', self.config.get('external_task_id', '')),
+            'callback_url': task_data.get('callback_url', self.config.get('callback_url', '')),
         }
-        payload = remove_empty_values(render_template(self.request_template, render_context))
+        
+        # Add mode-specific fields
+        if self.api_mode == 'generations':
+            base_context['negative_prompt'] = negative_prompt
+            base_context['image_value'] = resolve_image_value(image_path) if image_path else ''
+            base_context['image_count'] = image_count
+        elif self.api_mode == 'omni_image':
+            base_context['image_list'] = image_list
+            base_context['element_list'] = element_list
+        
+        # Render template and create payload
+        payload = render_template(self.request_template, base_context)
 
         response_payload = self.send_json_request('POST', self.build_url(self.create_endpoint), payload)
         task_id = str(get_nested_value(response_payload, self.task_id_path, '')).strip()
@@ -549,7 +552,9 @@ class KlingAIClient:
         if not result_url:
             raise ValueError('Result URL is empty')
 
-        safe_name = output_name.strip() or f'kling_result_{int(time.time())}'
+        base_name = output_name.strip() or 'kling_result'
+        timestamp = int(time.time())
+        safe_name = f'{base_name}_{timestamp}'
         suffix = Path(parse.urlparse(result_url).path).suffix or '.png'
         output_path = self.output_dir / f'{safe_name}{suffix}'
         logger.info('Downloading result: {}', result_url)
@@ -563,32 +568,119 @@ class KlingAIClient:
         logger.info('Downloaded result to: {}', output_path)
         return output_path
 
-    def run_task(self, task_data: dict[str, Any]) -> dict[str, Any]:
+    def _initialize_mode_settings(self, mode: str) -> None:
+        '''Initialize mode-specific settings.'''
+        create_endpoints = self.config.get('create_endpoints', {})
+        query_endpoints = self.config.get('query_endpoint_templates', {})
+        if isinstance(create_endpoints, dict) and mode in create_endpoints:
+            self.create_endpoint = str(create_endpoints[mode])
+        else:
+            self.create_endpoint = str(self.config.get('create_endpoint', ''))
+        if isinstance(query_endpoints, dict) and mode in query_endpoints:
+            self.query_endpoint_template = str(query_endpoints[mode])
+        else:
+            self.query_endpoint_template = str(self.config.get('query_endpoint_template', ''))
+        
+        request_templates = self.config.get('request_templates', {})
+        if isinstance(request_templates, dict) and mode in request_templates:
+            self.request_template = request_templates[mode]
+        else:
+            self.request_template = self.config.get('request_template', {})
+        
+        self.task_id_path = str(
+            resolve_mode_config_value(self.config, mode, 'task_id_paths', 'task_id_path', 'data.task_id')
+        )
+        self.status_path = str(resolve_mode_config_value(self.config, mode, 'status_paths', 'status_path', 'data.status'))
+        self.result_url_path = str(
+            resolve_mode_config_value(self.config, mode, 'result_url_paths', 'result_url_path', 'data.images.0.url')
+        )
+        self.result_url_fallback_paths = resolve_mode_config_value(
+            self.config,
+            mode,
+            'result_url_fallback_paths_by_mode',
+            'result_url_fallback_paths',
+            [],
+        )
+        self.create_result_url_path = str(
+            resolve_mode_config_value(self.config, mode, 'create_result_url_paths', 'create_result_url_path', '')
+        ).strip()
+        self.error_message_path = str(
+            resolve_mode_config_value(self.config, mode, 'error_message_paths', 'error_message_path', 'message')
+        )
+        self.success_status_values = {
+            str(status).lower()
+            for status in resolve_mode_config_value(
+                self.config,
+                mode,
+                'success_status_values_by_mode',
+                'success_status_values',
+                ['success', 'succeeded', 'completed'],
+            )
+        }
+        self.running_status_values = {
+            str(status).lower()
+            for status in resolve_mode_config_value(
+                self.config,
+                mode,
+                'running_status_values_by_mode',
+                'running_status_values',
+                ['submitted', 'pending', 'queued', 'running', 'processing'],
+            )
+        }
+        self.failed_status_values = {
+            str(status).lower()
+            for status in resolve_mode_config_value(
+                self.config,
+                mode,
+                'failed_status_values_by_mode',
+                'failed_status_values',
+                ['failed', 'error', 'cancelled', 'canceled'],
+            )
+        }
+
+    def run_task(self, task_data: dict[str, Any], api_mode: str = None) -> dict[str, Any]:
         '''Run full lifecycle: create task, wait result, download image.'''
 
-        task_id, create_response = self.create_task(task_data)
-        if task_id:
-            result_response = self.wait_for_result(task_id)
-        else:
-            result_response = create_response
-        result_url = str(get_nested_value(result_response, self.result_url_path, '')).strip()
-        if not result_url and isinstance(self.result_url_fallback_paths, list):
-            for fallback_path in self.result_url_fallback_paths:
-                result_url = str(get_nested_value(result_response, str(fallback_path), '')).strip()
-                if result_url:
-                    break
-        if not result_url and self.create_result_url_path:
-            result_url = str(get_nested_value(create_response, self.create_result_url_path, '')).strip()
-        if not result_url:
-            raise RuntimeError(f'Completed task without result URL: {result_response}')
+        # Use provided api_mode or fall back to instance's api_mode
+        current_mode = api_mode or self.api_mode
+        
+        # Temporarily override api_mode for this task if needed
+        original_mode = self.api_mode
+        mode_changed = current_mode != original_mode
+        
+        if mode_changed:
+            self.api_mode = current_mode
+            self._initialize_mode_settings(current_mode)
 
-        output_name = str(task_data.get('output_name', '')).strip() or task_id
-        saved_path = self.download_result(result_url, output_name)
-        logger.info('Task completed: {}', task_id)
-        return {
-            'task_id': task_id,
-            'create_response': create_response,
-            'result_response': result_response,
-            'result_url': result_url,
-            'saved_path': str(saved_path),
-        }
+        try:
+            task_id, create_response = self.create_task(task_data)
+            if task_id:
+                result_response = self.wait_for_result(task_id)
+            else:
+                result_response = create_response
+            result_url = str(get_nested_value(result_response, self.result_url_path, '')).strip()
+            if not result_url and isinstance(self.result_url_fallback_paths, list):
+                for fallback_path in self.result_url_fallback_paths:
+                    result_url = str(get_nested_value(result_response, str(fallback_path), '')).strip()
+                    if result_url:
+                        break
+            if not result_url and self.create_result_url_path:
+                result_url = str(get_nested_value(create_response, self.create_result_url_path, '')).strip()
+            if not result_url:
+                raise RuntimeError(f'Completed task without result URL: {result_response}')
+
+            output_name = str(task_data.get('output_name', '')).strip() or task_id
+            saved_path = self.download_result(result_url, output_name)
+            logger.info('Task completed: {}', task_id)
+            return {
+                'task_id': task_id,
+                'create_response': create_response,
+                'result_response': result_response,
+                'result_url': result_url,
+                'saved_path': str(saved_path),
+            }
+        finally:
+            # Restore original api_mode if it was changed
+            if mode_changed:
+                self.api_mode = original_mode
+                self._initialize_mode_settings(original_mode)

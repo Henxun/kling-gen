@@ -7,8 +7,10 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QPixmap
+from openpyxl import load_workbook
+
+from PySide6.QtCore import QThread, Qt, Signal, QTimer
+from PySide6.QtGui import QPixmap, QMovie
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -43,6 +45,18 @@ PROMPT_COLUMN_ALIASES = ['prompt', '提示词', '描述词', '文案']
 API_MODE_OPTIONS = [
     ('generations', 'Generations'),
     ('omni_image', 'Omni Image'),
+]
+
+# 模型清单，来源于 KlingAI 文档
+MODEL_OPTIONS = [
+    ('kling-image-o1', 'kling-image-o1'),
+    ('kling-v3-omni', 'kling-v3-omni'),
+    ('kling-v1', 'kling-v1'),
+    ('kling-v1-5', 'kling-v1-5'),
+    ('kling-v2', 'kling-v2'),
+    ('kling-v2-new', 'kling-v2-new'),
+    ('kling-v2-1', 'kling-v2-1'),
+    ('kling-v3', 'kling-v3'),
 ]
 
 
@@ -84,21 +98,31 @@ def build_output_name(image_reference: str) -> str:
 
 
 def parse_table_file(file_path: str) -> list[dict[str, str]]:
-    '''读取 CSV 表格，并抽取图片路径与提示词字段。'''
+    '''读取 CSV 或 XLSX 表格，并抽取图片路径与提示词字段。'''
 
     resolved_path = Path(file_path)
-    sample_text = resolved_path.read_text(encoding='utf-8-sig')
-    try:
-        dialect = csv.Sniffer().sniff(sample_text[:1024])
-    except csv.Error:
-        dialect = csv.excel
-
     parsed_rows: list[dict[str, str]] = []
-    with resolved_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
-        reader = csv.DictReader(csv_file, dialect=dialect)
-        for row in reader:
-            image_path = pick_row_value(row, IMAGE_COLUMN_ALIASES)
-            prompt = pick_row_value(row, PROMPT_COLUMN_ALIASES)
+
+    if resolved_path.suffix.lower() in {'.xlsx', '.xls'}:
+        wb = load_workbook(resolved_path, read_only=True, data_only=True)
+        ws = wb.active
+        
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return parsed_rows
+        
+        headers = [str(cell) if cell is not None else '' for cell in rows[0]]
+        
+        for row in rows[1:]:
+            row_data = {}
+            for idx, header in enumerate(headers):
+                if idx < len(row):
+                    row_data[header] = str(row[idx]) if row[idx] is not None else ''
+                else:
+                    row_data[header] = ''
+            
+            image_path = pick_row_value(row_data, IMAGE_COLUMN_ALIASES)
+            prompt = pick_row_value(row_data, PROMPT_COLUMN_ALIASES)
             if not image_path and not prompt:
                 continue
 
@@ -110,6 +134,31 @@ def parse_table_file(file_path: str) -> list[dict[str, str]]:
                     'saved_path': '',
                 }
             )
+        
+        wb.close()
+    else:
+        sample_text = resolved_path.read_text(encoding='utf-8-sig')
+        try:
+            dialect = csv.Sniffer().sniff(sample_text[:1024])
+        except csv.Error:
+            dialect = csv.excel
+
+        with resolved_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
+            reader = csv.DictReader(csv_file, dialect=dialect)
+            for row in reader:
+                image_path = pick_row_value(row, IMAGE_COLUMN_ALIASES)
+                prompt = pick_row_value(row, PROMPT_COLUMN_ALIASES)
+                if not image_path and not prompt:
+                    continue
+
+                parsed_rows.append(
+                    {
+                        'image_path': image_path,
+                        'prompt': prompt,
+                        'status': '待生成',
+                        'saved_path': '',
+                    }
+                )
 
     return parsed_rows
 
@@ -125,12 +174,13 @@ class GenerateWorker(QThread):
     log_message = Signal(str)
     batch_finished = Signal()
 
-    def __init__(self, client: KlingAIClient, rows: list[tuple[int, dict[str, str]]]) -> None:
+    def __init__(self, client: KlingAIClient, rows: list[tuple[int, dict[str, str]]], api_mode: str) -> None:
         '''初始化待执行的任务列表。'''
 
         super().__init__()
         self.client = client
         self.rows = rows
+        self.api_mode = api_mode
 
     def run(self) -> None:
         '''依次执行每一行任务。'''
@@ -139,7 +189,7 @@ class GenerateWorker(QThread):
             self.row_started.emit(row_index, '生成中')
             self.log_message.emit(f'开始生成：第 {row_index + 1} 行')
             try:
-                result = self.client.run_task(row_data)
+                result = self.client.run_task(row_data, self.api_mode)
                 saved_path = result.get('saved_path', '')
                 self.row_finished.emit(
                     row_index,
@@ -181,11 +231,23 @@ class MainWindow(QMainWindow):
 
         self.table_widget = QTableWidget(0, len(COLUMN_KEYS))
         self.status_badge = QLabel('等待导入表格')
+        self.loading_label = QLabel()
+        self.loading_label.setText('⏳')
+        self.loading_label.setVisible(False)
+        self.loading_timer = QTimer()
+        self.loading_timer.timeout.connect(self.update_loading_animation)
+        self.loading_frame = 0
         self.mode_label = QLabel('请求模式')
         self.mode_selector = QComboBox()
+        self.model_label = QLabel('模型选择')
+        self.model_selector = QComboBox()
         self.source_preview_label = QLabel('选择表格中的一行后查看原图')
         self.result_preview_label = QLabel('生成完成后在这里预览结果')
         self.log_output = QPlainTextEdit()
+        self.import_button = QPushButton('导入表格')
+        self.add_button = QPushButton('新增一行')
+        self.remove_button = QPushButton('删除选中')
+        self.run_button = QPushButton('开始生成')
 
         self.setup_ui()
         self.append_task_row()
@@ -218,30 +280,35 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(18, 14, 18, 14)
         action_layout.setSpacing(12)
 
-        import_button = QPushButton('导入表格')
-        add_button = QPushButton('新增一行')
-        remove_button = QPushButton('删除选中')
-        run_button = QPushButton('开始生成')
-        run_button.setObjectName('primary_button')
+        self.run_button.setObjectName('primary_button')
 
-        import_button.clicked.connect(self.import_table)
-        add_button.clicked.connect(self.append_task_row)
-        remove_button.clicked.connect(self.remove_selected_rows)
-        run_button.clicked.connect(self.start_generation)
+        self.import_button.clicked.connect(self.import_table)
+        self.add_button.clicked.connect(self.append_task_row)
+        self.remove_button.clicked.connect(self.remove_selected_rows)
+        self.run_button.clicked.connect(self.start_generation)
         self.mode_selector.currentIndexChanged.connect(self.on_mode_changed)
 
         for mode_value, mode_label in API_MODE_OPTIONS:
             self.mode_selector.addItem(mode_label, mode_value)
         self.set_mode_selector_value(str(self.config.get('api_mode', 'generations')).strip().lower() or 'generations')
 
-        action_layout.addWidget(import_button)
-        action_layout.addWidget(add_button)
-        action_layout.addWidget(remove_button)
+        # 添加模型选择下拉框
+        for model_value, model_label in MODEL_OPTIONS:
+            self.model_selector.addItem(model_label, model_value)
+        default_model = str(self.config.get('model_name', 'kling-v2-1')).strip()
+        self.set_model_selector_value(default_model)
+
+        action_layout.addWidget(self.import_button)
+        action_layout.addWidget(self.add_button)
+        action_layout.addWidget(self.remove_button)
         action_layout.addWidget(self.mode_label)
         action_layout.addWidget(self.mode_selector)
+        action_layout.addWidget(self.model_label)
+        action_layout.addWidget(self.model_selector)
         action_layout.addStretch(1)
         action_layout.addWidget(self.status_badge)
-        action_layout.addWidget(run_button)
+        action_layout.addWidget(self.loading_label)
+        action_layout.addWidget(self.run_button)
 
         self.table_widget.setHorizontalHeaderLabels(COLUMN_LABELS)
         self.table_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -329,10 +396,12 @@ class MainWindow(QMainWindow):
                 font-size: 28px;
                 font-weight: 700;
                 color: #1d3557;
+                border: none;
             }
             QLabel#subtitle_label {
                 color: #5f6b76;
                 font-size: 13px;
+                border: none;
             }
             QLabel#section_title {
                 font-size: 15px;
@@ -366,6 +435,20 @@ class MainWindow(QMainWindow):
                 border-radius: 12px;
                 padding: 6px 10px;
                 min-width: 140px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 8px;
+            }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                color: #1d3557;
+                border: 1px solid #d6c7ae;
+                border-radius: 8px;
+                selection-background-color: #dfece4;
+                selection-color: #1d3557;
                 font-size: 13px;
                 font-weight: 600;
             }
@@ -415,6 +498,23 @@ class MainWindow(QMainWindow):
         if target_index >= 0:
             self.mode_selector.setCurrentIndex(target_index)
 
+    def set_model_selector_value(self, model_value: str) -> None:
+        '''Sync model selector with config value.'''
+
+        target_index = self.model_selector.findData(model_value)
+        if target_index < 0:
+            target_index = self.model_selector.findData('kling-v2-1')
+        if target_index >= 0:
+            self.model_selector.setCurrentIndex(target_index)
+
+    def get_selected_model(self) -> str:
+        '''Read selected model from combo box.'''
+
+        selected_model = self.model_selector.currentData()
+        if isinstance(selected_model, str) and selected_model.strip():
+            return selected_model.strip()
+        return 'kling-v2-1'
+
     def get_selected_api_mode(self) -> str:
         '''Read selected API mode from combo box.'''
 
@@ -423,20 +523,13 @@ class MainWindow(QMainWindow):
             return selected_mode.strip()
         return 'generations'
 
-    def refresh_client_for_selected_mode(self) -> None:
-        '''Recreate client according to selected request mode.'''
-
-        selected_mode = self.get_selected_api_mode()
-        self.config['api_mode'] = selected_mode
-        self.client = KlingAIClient(self.config)
-        self.log(f'已切换请求模式: {selected_mode}')
-
     def on_mode_changed(self, _index: int) -> None:
         '''Apply mode selection immediately when idle.'''
 
         if self.worker_thread and self.worker_thread.isRunning():
             return
-        self.refresh_client_for_selected_mode()
+        # Mode selection is now handled by passing api_mode to run_task
+        pass
 
     def append_task_row(self, image_path: str = '', prompt: str = '') -> None:
         '''新增一行任务数据。'''
@@ -453,9 +546,9 @@ class MainWindow(QMainWindow):
             self.table_widget.setItem(row_index, column_index, QTableWidgetItem(default_values[column_key]))
 
     def import_table(self) -> None:
-        '''从 CSV 表格导入任务。'''
+        '''从 CSV 或 XLSX 表格导入任务。'''
 
-        file_path, _ = QFileDialog.getOpenFileName(self, '导入表格', '', 'CSV 文件 (*.csv)')
+        file_path, _ = QFileDialog.getOpenFileName(self, '导入表格', '', '表格文件 (*.csv *.xlsx *.xls)')
         if not file_path:
             return
 
@@ -528,6 +621,9 @@ class MainWindow(QMainWindow):
         '''筛选出可执行的任务行，并补全输出文件名。'''
 
         rows_to_run: list[tuple[int, dict[str, str]]] = []
+        selected_mode = self.get_selected_api_mode()
+        selected_model = self.get_selected_model()
+        
         for row_index in range(self.table_widget.rowCount()):
             row_data = self.read_row_data(row_index)
             image_path = row_data.get('image_path', '')
@@ -538,6 +634,12 @@ class MainWindow(QMainWindow):
                 continue
 
             row_data['output_name'] = build_output_name(image_path)
+            row_data['model_name'] = selected_model
+            
+            # For omni_image mode, add image_path to image_list
+            if selected_mode == 'omni_image':
+                row_data['image_list'] = [image_path]
+            
             rows_to_run.append((row_index, row_data))
 
         return rows_to_run
@@ -554,8 +656,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '提示', '没有可执行的任务，请确认表格中同时包含图片路径和提示词。')
             return
 
-        self.refresh_client_for_selected_mode()
-        self.worker_thread = GenerateWorker(self.client, rows_to_run)
+        selected_mode = self.get_selected_api_mode()
+        self.worker_thread = GenerateWorker(self.client, rows_to_run, selected_mode)
         self.worker_thread.row_started.connect(self.on_row_started)
         self.worker_thread.row_finished.connect(self.on_row_finished)
         self.worker_thread.log_message.connect(self.log)
@@ -564,6 +666,13 @@ class MainWindow(QMainWindow):
 
         self.table_widget.setDisabled(True)
         self.mode_selector.setDisabled(True)
+        self.model_selector.setDisabled(True)
+        self.import_button.setDisabled(True)
+        self.add_button.setDisabled(True)
+        self.remove_button.setDisabled(True)
+        self.run_button.setDisabled(True)
+        self.loading_label.setVisible(True)
+        self.loading_timer.start(300)
         self.status_badge.setText(f'正在生成 {len(rows_to_run)} 条任务')
         self.log('批量生成已启动')
 
@@ -585,6 +694,13 @@ class MainWindow(QMainWindow):
 
         self.table_widget.setDisabled(False)
         self.mode_selector.setDisabled(False)
+        self.model_selector.setDisabled(False)
+        self.import_button.setDisabled(False)
+        self.add_button.setDisabled(False)
+        self.remove_button.setDisabled(False)
+        self.run_button.setDisabled(False)
+        self.loading_timer.stop()
+        self.loading_label.setVisible(False)
         self.status_badge.setText('全部生成完成')
         self.log('批量生成结束')
         QMessageBox.information(self, '提示', '全部任务已经处理完成。')
@@ -593,6 +709,12 @@ class MainWindow(QMainWindow):
         '''向日志面板追加一行文本。'''
 
         self.log_output.appendPlainText(message)
+
+    def update_loading_animation(self) -> None:
+        '''更新loading动画状态。'''
+        self.loading_frame = (self.loading_frame + 1) % 4
+        loading_chars = ['⏳', '⌛', '⏰', '⏱']
+        self.loading_label.setText(loading_chars[self.loading_frame])
 
     def refresh_previews(self) -> None:
         '''刷新原图与结果图的预览区域。'''
