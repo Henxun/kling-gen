@@ -62,6 +62,53 @@ class ApiImageEncodingTests(unittest.TestCase):
 class ApiModeConfigTests(unittest.TestCase):
     '''Validate mode-specific path/status config resolution.'''
 
+    def test_run_task_saves_result_next_to_local_source_image(self) -> None:
+        '''Local source images should make downloads land in the same directory.'''
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = Path(temp_dir) / 'images'
+            source_dir.mkdir()
+            image_path = source_dir / 'cat.png'
+            image_path.write_bytes(b'fake-image')
+
+            class FakeClient(KlingAIClient):
+                def create_task(self, task_data: dict[str, str]) -> tuple[str, dict]:  # type: ignore[override]
+                    return 'task-1', {'data': {'task_id': 'task-1'}}
+
+                def wait_for_result(self, task_id: str) -> dict:  # type: ignore[override]
+                    return {'data': {'task_status': 'succeed', 'task_result': {'images': [{'url': 'https://example.com/result.png'}]}}}
+
+                def download_result(
+                    self,
+                    result_url: str,
+                    output_name: str,
+                    output_dir: Path | None = None,
+                ) -> Path:  # type: ignore[override]
+                    self._downloaded_url = result_url
+                    self._downloaded_dir = output_dir
+                    return (output_dir or self.output_dir) / 'cat_ai_123.png'
+
+            client = FakeClient(
+                {
+                    'auth_mode': 'api_key',
+                    'api_key': 'test-token',
+                    'base_url': 'https://api-beijing.klingai.com',
+                    'api_mode': 'generations',
+                    'output_dir': 'outputs',
+                    'headers': {
+                        'Authorization': '{authorization}',
+                        'Content-Type': 'application/json',
+                    },
+                    'request_templates': {'generations': {'prompt': '{prompt}'}},
+                    'result_url_paths': {'generations': 'data.task_result.images.0.url'},
+                }
+            )
+
+            result = client.run_task({'image_path': str(image_path), 'prompt': 'test', 'output_name': 'cat_ai'})
+            self.assertEqual(client._downloaded_url, 'https://example.com/result.png')
+            self.assertEqual(client._downloaded_dir, source_dir)
+            self.assertEqual(result['saved_path'], str(source_dir / 'cat_ai_123.png'))
+
     def test_omni_mode_uses_task_status_and_task_result_paths(self) -> None:
         '''omni_image mode should use its own status/result/error paths.'''
 
@@ -141,9 +188,14 @@ class ApiModeConfigTests(unittest.TestCase):
                     }
                 }
 
-            def download_result(self, result_url: str, output_name: str) -> Path:  # type: ignore[override]
+            def download_result(
+                self,
+                result_url: str,
+                output_name: str,
+                output_dir: Path | None = None,
+            ) -> Path:  # type: ignore[override]
                 self._downloaded_url = result_url
-                return Path('outputs/fallback.png')
+                return (output_dir or self.output_dir) / 'fallback.png'
 
         client = FakeClient(
             {

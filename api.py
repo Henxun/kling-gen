@@ -157,6 +157,13 @@ def resolve_image_value(image_input: str) -> str:
     return encode_image_to_base64(normalized)
 
 
+def is_remote_image_reference(image_input: str) -> bool:
+    '''Return True when the image reference points to a remote URL.'''
+
+    normalized = image_input.strip()
+    return normalized.startswith('http://') or normalized.startswith('https://')
+
+
 def parse_json_like_value(raw_value: Any, field_name: str) -> Any:
     '''Parse JSON-like string values while keeping native list/dict inputs.'''
 
@@ -335,6 +342,38 @@ class KlingAIClient:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info('KlingAI client initialized, output dir: {}', self.output_dir)
+
+    def resolve_output_dir(self, task_data: dict[str, Any]) -> Path:
+        '''Prefer the local source image directory; otherwise use configured output dir.'''
+
+        image_references: list[str] = []
+
+        image_path = str(task_data.get('image_path', '')).strip()
+        if image_path:
+            image_references.append(image_path)
+
+        image_list_value = parse_json_like_value(task_data.get('image_list', []), 'image_list')
+        if isinstance(image_list_value, list):
+            for image_item in image_list_value:
+                if isinstance(image_item, str):
+                    normalized_reference = image_item.strip()
+                    if normalized_reference:
+                        image_references.append(normalized_reference)
+                    continue
+
+                if isinstance(image_item, dict):
+                    normalized_reference = str(image_item.get('image', '')).strip()
+                    if normalized_reference:
+                        image_references.append(normalized_reference)
+
+        for image_reference in image_references:
+            if is_remote_image_reference(image_reference):
+                continue
+
+            source_path = Path(image_reference).expanduser()
+            return source_path.parent
+
+        return self.output_dir
 
     def build_jwt_token(self) -> str:
         '''Build JWT token with HS256 according to provider example.'''
@@ -546,7 +585,7 @@ class KlingAIClient:
 
         raise TimeoutError(f'Task timeout: {task_id}')
 
-    def download_result(self, result_url: str, output_name: str) -> Path:
+    def download_result(self, result_url: str, output_name: str, output_dir: Path | None = None) -> Path:
         '''Download generated image to local output directory.'''
 
         if not result_url:
@@ -556,7 +595,9 @@ class KlingAIClient:
         timestamp = int(time.time())
         safe_name = f'{base_name}_{timestamp}'
         suffix = Path(parse.urlparse(result_url).path).suffix or '.png'
-        output_path = self.output_dir / f'{safe_name}{suffix}'
+        resolved_output_dir = output_dir or self.output_dir
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = resolved_output_dir / f'{safe_name}{suffix}'
         logger.info('Downloading result: {}', result_url)
 
         try:
@@ -670,7 +711,7 @@ class KlingAIClient:
                 raise RuntimeError(f'Completed task without result URL: {result_response}')
 
             output_name = str(task_data.get('output_name', '')).strip() or task_id
-            saved_path = self.download_result(result_url, output_name)
+            saved_path = self.download_result(result_url, output_name, self.resolve_output_dir(task_data))
             logger.info('Task completed: {}', task_id)
             return {
                 'task_id': task_id,
